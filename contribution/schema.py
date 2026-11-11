@@ -5,7 +5,12 @@ import graphene_django_optimizer as gql_optimizer
 from .apps import ContributionConfig
 from location.apps import LocationConfig
 from django.utils.translation import gettext as _
-from core.schema import signal_mutation_module_before_mutating, OrderedDjangoFilterConnectionField, filter_validity
+from core.schema import signal_mutation_module_before_mutating, signal_mutation_module_after_mutating, \
+    OrderedDjangoFilterConnectionField, filter_validity
+from core.gql import legacy_row_filters, row_filter_arguments
+from core.models import Audits, Validity
+from insuree.uba import can_query
+from policy.models import Policy
 # We do need all queries and mutations in the namespace here.
 from .gql_queries import *  # lgtm [py/polluting-import]
 from .gql_mutations import *  # lgtm [py/polluting-import]
@@ -75,7 +80,7 @@ class Query(graphene.ObjectType):
         PremiumGQLType,
         payer_id=graphene.ID(),
         client_mutation_id=graphene.String(),
-        show_history=graphene.Boolean(),
+        **row_filter_arguments(),
         parent_location=graphene.String(),
         parent_location_level=graphene.Int(),
         orderBy=graphene.List(of_type=graphene.String),
@@ -83,6 +88,7 @@ class Query(graphene.ObjectType):
     premiums_by_policies = OrderedDjangoFilterConnectionField(
         PremiumGQLType,
         policy_uuids=graphene.List(graphene.String, required=True),
+        **row_filter_arguments(),
         orderBy=graphene.List(of_type=graphene.String),
     )
     validate_premium_code = graphene.Field(
@@ -95,7 +101,9 @@ class Query(graphene.ObjectType):
     def resolve_premiums(self, info, **kwargs):
         fields = get_fields(info)
         queryset = Premium.objects
-        if not info.context.user.has_perms(ContributionConfig.gql_query_premiums_perms):
+        # the right globally or in the UBA bag; the rows are narrowed to the policies the
+        # user may see by Premium.get_queryset (PremiumGQLType)
+        if not can_query(info.context.user, ContributionConfig.gql_query_premiums_perms):
             raise PermissionDenied(_("unauthorized"))
         filters = []
         client_mutation_id = kwargs.get("client_mutation_id", None)
@@ -104,9 +112,13 @@ class Query(graphene.ObjectType):
             filters.append(Q(payer__id=payer_id))
         if client_mutation_id:
             filters.append(Q(mutations__mutation__client_mutation_id=client_mutation_id))
-        show_history = kwargs.get('show_history', False)
-        if not show_history and not kwargs.get('uuid', None):
-            filters += filter_validity(**kwargs)
+        # validity / audits are applied by Premium.get_queryset (OP-2029); showHistory and
+        # a lookup by uuid keep their legacy meaning: no validity filter at all
+        everything = kwargs.get('show_history', False) or kwargs.get('uuid', None)
+        legacy_row_filters(
+            info, kwargs,
+            validity=Validity.ALL if everything else Validity.NOW,
+            audits=Audits.ALL if everything else None)
         parent_location = kwargs.get('parent_location')
         if parent_location is not None:
             parent_location_level = kwargs.get('parent_location_level')
@@ -122,16 +134,22 @@ class Query(graphene.ObjectType):
         return gql_optimizer.query(queryset.filter(*filters).all(), info)
 
     def resolve_premiums_by_policies(self, info, **kwargs):
-        if not info.context.user.has_perms(ContributionConfig.gql_query_premiums_perms):
+        if not can_query(info.context.user, ContributionConfig.gql_query_premiums_perms):
             raise PermissionDenied(_("unauthorized"))
-        policies = policy_models.Policy.objects.values_list('id').filter(Q(uuid__in=kwargs.get('policy_uuids')))
-        return Premium.objects.filter(Q(policy_id__in=policies), *filter_validity(**kwargs))
+        # the premiums of policies out of the user's scope are left out by
+        # Premium.get_queryset (PremiumGQLType); current ones by default (OP-2029)
+        legacy_row_filters(info, kwargs, validity=Validity.NOW)
+        return Premium.objects.filter(policy__uuid__in=kwargs.get('policy_uuids'))
 
     def resolve_validate_premium_code(self, info, **kwargs):
-        if not info.context.user.has_perms(ContributionConfig.gql_query_premiums_perms):
+        if not can_query(info.context.user, ContributionConfig.gql_query_premiums_perms):
             raise PermissionDenied(_("unauthorized"))
-        errors = check_unique_premium_receipt_code_within_product(code=kwargs['code'],
-                                                                  policy_uuid=kwargs['policy_uuid'])
+        # only for a policy the user may see
+        policy = Policy.get_queryset(Policy.objects.filter(uuid=kwargs['policy_uuid']), info.context.user) \
+            .select_related('product').first()
+        if policy is None:
+            raise PermissionDenied(_("unauthorized"))
+        errors = check_unique_premium_receipt_code_within_product(code=kwargs['code'], policy=policy)
         return False if errors else True
 
 
@@ -156,5 +174,7 @@ class Mutation(graphene.ObjectType):
 
 
 def bind_signals():
-    signal_mutation_module_before_mutating["policy"].connect(on_policy_mutation)
+    # after the policy mutation, which checked its rights and scope: the premiums of the
+    # policies it did delete follow them (it ran before, for any policy named)
+    signal_mutation_module_after_mutating["policy"].connect(on_policy_mutation)
     signal_mutation_module_before_mutating["contribution"].connect(on_premium_mutation)

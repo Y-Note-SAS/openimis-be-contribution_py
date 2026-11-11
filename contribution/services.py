@@ -268,7 +268,10 @@ def check_unique_premium_receipt_code_within_product(code, policy_uuid = None, p
 
 
 def update_or_create_premium(premium, user, action=None):
-    existing_premium = Premium.objects.filter(*filter_validity(), Q(Q(uuid=premium.uuid) | Q(id=premium.id))).first()
+    # by uuid only, within the user's scope: an id or a uuid out of scope does not
+    # select an existing premium
+    existing_premium = Premium.get_queryset(Premium.objects.filter(uuid=premium.uuid), user).first() \
+        if premium.uuid else None
     if existing_premium:
         return update_premium(existing_premium, premium, user, action)
     else:  
