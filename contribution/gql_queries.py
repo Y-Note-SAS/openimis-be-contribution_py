@@ -4,12 +4,13 @@ from graphene_django import DjangoObjectType
 from .apps import ContributionConfig
 from .models import Premium, PremiumMutation
 from core import prefix_filterset, ExtendedConnection
+from core.gql.scoped_object_type import ScopedQuerysetMixin
 from policy.schema import PolicyGQLType
 from django.core.exceptions import PermissionDenied
 from django.utils.translation import gettext as _
 
 
-class PremiumGQLType(DjangoObjectType):
+class PremiumGQLType(ScopedQuerysetMixin, DjangoObjectType):
     client_mutation_id = graphene.String()
     other_premiums = graphene.Float(source="other_premiums")
 

@@ -2,6 +2,7 @@ import uuid
 
 from core import fields
 from core import models as core_models
+from django.conf import settings
 from django.db import models
 from django.utils.translation import gettext_lazy
 
@@ -18,6 +19,9 @@ class PayTypeChoices(models.TextChoices):
 
 
 class Premium(core_models.VersionedModel):
+    # a premium is seen by whoever sees its policy (district + ENROLMENT UBA link)
+    row_scope = core_models.ParentScope("policy")
+
     id = models.AutoField(db_column="PremiumId", primary_key=True)
     uuid = models.CharField(
         db_column="PremiumUUID", max_length=36, default=uuid.uuid4, unique=True
@@ -71,6 +75,18 @@ class Premium(core_models.VersionedModel):
                 filter = models.Q(~models.Q(id=self.id) & models.Q(*core_models.filter_validity(prefix=''),is_photo_fee=False))
             )
         )['other_premiums'] or 0
+    @classmethod
+    def get_queryset(cls, queryset, user=None, *, validity=None, audits=None):
+        """The premiums of the policies `user` may see; current ones unless validity /
+        audits ask otherwise (OP-2029)."""
+        queryset = cls.apply_row_filters(queryset, validity, audits, default=cls.filter_queryset)
+        user = cls.scoping_user(user)
+        if settings.ROW_SECURITY and (user is None or getattr(user, "is_anonymous", True)):
+            return queryset.none()
+        if not settings.ROW_SECURITY:
+            return queryset
+        return cls.row_scope.filter(queryset, user, cls)
+
     class Meta:
         managed = True
         db_table = 'tblPremium'
